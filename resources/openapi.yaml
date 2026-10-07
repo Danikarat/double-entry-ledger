@@ -1,0 +1,780 @@
+openapi: 3.0.3
+info:
+  title: Ledger API
+  version: 1.0.0
+  description: |
+    Double-entry ledger with multi-currency transfers, holds, asynchronous posting, and reversals.
+
+    **Describes the finished (M5) API.** Milestone differences:
+    - M1: `POST /v1/transfers`, deposits, and withdrawals post synchronously and return `201` with status `POSTED`.
+    - From M2: they return `202` with status `PENDING`; poll `GET /v1/transfers/{transfer_id}`.
+    - Reversal endpoints arrive in M3, the statement in M3, FX endpoints and cross-currency transfers in M4.
+
+    **Money:** all amounts are integers in minor units (for example GHS 12.50 is `1250`; JPY has no minor unit).
+    FX rates are decimal strings.
+
+    **Idempotency:** `Idempotency-Key` is required on every money-moving POST. A repeat with the same key and
+    request returns `200` with the current transfer and header `Idempotent-Replayed: true`.
+servers:
+  - url: http://localhost:8080
+    description: Local development
+security:
+  - ApiKeyAuth: []
+tags:
+  - name: Ops
+  - name: Currencies
+  - name: Accounts
+  - name: Funding
+  - name: Transfers
+  - name: FX
+
+paths:
+  /healthz:
+    get:
+      tags: [Ops]
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: Process is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /readyz:
+    get:
+      tags: [Ops]
+      summary: Readiness probe (database reachable; workers running from M2)
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/currencies:
+    get:
+      tags: [Currencies]
+      summary: List currencies
+      responses:
+        '200':
+          description: Currencies
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Currency' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Currencies]
+      summary: Create a currency and its two system accounts atomically
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CurrencyCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Currency' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/accounts:
+    get:
+      tags: [Accounts]
+      summary: List accounts
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: currency
+          in: query
+          schema: { type: string, pattern: '^[A-Z]{3}$' }
+        - name: type
+          in: query
+          schema: { type: string, enum: [CUSTOMER, SYSTEM] }
+      responses:
+        '200':
+          description: A page of accounts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Account' }
+                  next_cursor:
+                    type: string
+                    nullable: true
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Accounts]
+      summary: Create a customer account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/accounts/{account_id}:
+    get:
+      tags: [Accounts]
+      summary: Get an account with balances
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+      responses:
+        '200':
+          description: The account
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/accounts/{account_id}/statement:
+    get:
+      tags: [Accounts]
+      summary: Ledger statement with running balance (M3)
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: from
+          in: query
+          description: Inclusive lower bound on entry time
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: Exclusive upper bound on entry time
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of statement lines in ascending entry order
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Statement' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/accounts/{account_id}/deposits:
+    post:
+      tags: [Funding]
+      summary: Deposit funds (from the currency's EXTERNAL account)
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FundingRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/TransferPostedM1' }
+        '202': { $ref: '#/components/responses/TransferAccepted' }
+        '200': { $ref: '#/components/responses/TransferReplay' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/accounts/{account_id}/withdrawals:
+    post:
+      tags: [Funding]
+      summary: Withdraw funds (to the currency's EXTERNAL account)
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FundingRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/TransferPostedM1' }
+        '202': { $ref: '#/components/responses/TransferAccepted' }
+        '200': { $ref: '#/components/responses/TransferReplay' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/transfers:
+    get:
+      tags: [Transfers]
+      summary: List transfers
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: account_id
+          in: query
+          description: Matches either side of the transfer
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/TransferStatus' }
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/TransferType' }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: A page of transfers, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transfer' }
+                  next_cursor:
+                    type: string
+                    nullable: true
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Transfers]
+      summary: Submit a transfer between two customer accounts
+      description: |
+        Amount is in minor units of the source account's currency. Cross-currency transfers (M4) convert at the
+        rate effective when the transfer is posted; the rate used is returned on the transfer.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/TransferPostedM1' }
+        '202': { $ref: '#/components/responses/TransferAccepted' }
+        '200': { $ref: '#/components/responses/TransferReplay' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/transfers/{transfer_id}:
+    get:
+      tags: [Transfers]
+      summary: Get a transfer (poll this for the final status)
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+      responses:
+        '200':
+          description: The transfer
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transfer' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/transfers/{transfer_id}/reverse:
+    post:
+      tags: [Transfers]
+      summary: Reverse a posted transfer by compensating entries (M3)
+      description: |
+        Creates a `REVERSAL` transfer that negates the original's entries. The original becomes `REVERSED` when the
+        reversal posts. The party returning funds must have available funds.
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReverseRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/TransferAccepted' }
+        '200': { $ref: '#/components/responses/TransferReplay' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /v1/fx-rates:
+    get:
+      tags: [FX]
+      summary: Get the effective rate for a direct pair (M4)
+      parameters:
+        - name: base_currency
+          in: query
+          required: true
+          schema: { type: string, pattern: '^[A-Z]{3}$' }
+        - name: quote_currency
+          in: query
+          required: true
+          schema: { type: string, pattern: '^[A-Z]{3}$' }
+      responses:
+        '200':
+          description: The latest rate whose effective time is not in the future
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FxRate' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [FX]
+      summary: Append a manual rate (M4)
+      description: Rates are append-only; to correct a rate, post a newer one.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FxRateCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FxRate' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/fx-rates/history:
+    get:
+      tags: [FX]
+      summary: Rate history for a direct pair (M4)
+      parameters:
+        - name: base_currency
+          in: query
+          required: true
+          schema: { type: string, pattern: '^[A-Z]{3}$' }
+        - name: quote_currency
+          in: query
+          required: true
+          schema: { type: string, pattern: '^[A-Z]{3}$' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of rates, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/FxRate' }
+                  next_cursor:
+                    type: string
+                    nullable: true
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  parameters:
+    AccountId:
+      name: account_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TransferId:
+      name: transfer_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: 'One to 100 characters from A-Z, a-z, 0-9, underscore, hyphen, colon, or period'
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 100
+        pattern: '^[A-Za-z0-9_\-:.]+$'
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous response's `next_cursor`
+      schema: { type: string }
+
+  headers:
+    RequestId:
+      description: Request id (echoes `X-Request-ID` if supplied, otherwise generated)
+      schema: { type: string }
+
+  responses:
+    TransferPostedM1:
+      description: |
+        M1 only: the transfer was posted synchronously.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Transfer' }
+    TransferAccepted:
+      description: |
+        M2 onward: accepted for asynchronous processing. Poll the `Location` URL for the final status.
+      headers:
+        Location:
+          description: URL of the transfer resource
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Transfer' }
+    TransferReplay:
+      description: Idempotent replay of an earlier request; body is the current state of that transfer.
+      headers:
+        Idempotent-Replayed:
+          description: Always `true` on a replay
+          schema: { type: string, enum: ['true'] }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Transfer' }
+    BadRequest:
+      description: Malformed request, unknown fields, bad parameters, or missing idempotency key (`INVALID_REQUEST`, `IDEMPOTENCY_KEY_REQUIRED`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing or invalid API key (`UNAUTHORIZED`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found (`NOT_FOUND`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: State conflict (`CONFLICT`, `TRANSFER_NOT_REVERSIBLE`, `ALREADY_REVERSED`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: |
+        Semantically invalid (`VALIDATION_ERROR`, `INSUFFICIENT_FUNDS`, `SAME_ACCOUNT`, `ACCOUNT_NOT_ELIGIBLE`,
+        `CURRENCY_MISMATCH`, `IDEMPOTENCY_KEY_REUSED`, `FX_RATE_UNAVAILABLE`, `FX_RATE_STALE`, `AMOUNT_TOO_SMALL`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: Database unreachable or retries exhausted (`SERVICE_UNAVAILABLE`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - INVALID_REQUEST
+                - IDEMPOTENCY_KEY_REQUIRED
+                - UNAUTHORIZED
+                - NOT_FOUND
+                - CONFLICT
+                - TRANSFER_NOT_REVERSIBLE
+                - ALREADY_REVERSED
+                - VALIDATION_ERROR
+                - INSUFFICIENT_FUNDS
+                - SAME_ACCOUNT
+                - ACCOUNT_NOT_ELIGIBLE
+                - CURRENCY_MISMATCH
+                - IDEMPOTENCY_KEY_REUSED
+                - FX_RATE_UNAVAILABLE
+                - FX_RATE_STALE
+                - AMOUNT_TOO_SMALL
+                - INTERNAL
+                - SERVICE_UNAVAILABLE
+            message: { type: string }
+            request_id: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+      example:
+        error:
+          code: INSUFFICIENT_FUNDS
+          message: Available balance is lower than the requested amount.
+          request_id: 7f1c2d9e
+          details: { available_balance: 1500, requested: 2500 }
+
+    Amount:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 1000000000000000
+      description: Minor units of the relevant currency
+
+    CurrencyCode:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      example: GHS
+
+    Currency:
+      type: object
+      required: [code, name, exponent]
+      properties:
+        code: { $ref: '#/components/schemas/CurrencyCode' }
+        name: { type: string, example: Ghana Cedi }
+        exponent: { type: integer, minimum: 0, maximum: 4, example: 2 }
+        created_at: { type: string, format: date-time }
+
+    CurrencyCreate:
+      type: object
+      required: [code, name, exponent]
+      additionalProperties: false
+      properties:
+        code: { $ref: '#/components/schemas/CurrencyCode' }
+        name: { type: string, minLength: 1, maxLength: 100 }
+        exponent: { type: integer, minimum: 0, maximum: 4 }
+
+    AccountCreate:
+      type: object
+      required: [name, currency]
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        currency: { $ref: '#/components/schemas/CurrencyCode' }
+
+    Account:
+      type: object
+      required: [id, name, currency, account_type, ledger_balance, held_amount, available_balance, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        currency: { $ref: '#/components/schemas/CurrencyCode' }
+        account_type: { type: string, enum: [CUSTOMER, SYSTEM] }
+        system_role:
+          type: string
+          nullable: true
+          enum: [EXTERNAL, FX_CLEARING]
+        ledger_balance: { type: integer, format: int64, description: Sum of ledger entries (minor units) }
+        held_amount: { type: integer, format: int64, description: Sum of active holds (0 before M2) }
+        available_balance: { type: integer, format: int64, description: ledger_balance minus held_amount }
+        created_at: { type: string, format: date-time }
+
+    FundingRequest:
+      type: object
+      required: [amount, currency]
+      additionalProperties: false
+      properties:
+        amount: { $ref: '#/components/schemas/Amount' }
+        currency: { $ref: '#/components/schemas/CurrencyCode' }
+        reference: { type: string, maxLength: 200 }
+
+    TransferCreate:
+      type: object
+      required: [source_account_id, destination_account_id, amount, currency]
+      additionalProperties: false
+      properties:
+        source_account_id: { type: string, format: uuid }
+        destination_account_id: { type: string, format: uuid }
+        amount:
+          allOf:
+            - $ref: '#/components/schemas/Amount'
+          description: Minor units of the source account's currency
+        currency:
+          allOf:
+            - $ref: '#/components/schemas/CurrencyCode'
+          description: Must equal the source account's currency
+        reference: { type: string, maxLength: 200 }
+      example:
+        source_account_id: 0b6f4a52-3c8e-4d1a-9a77-5a2f3c1d8e90
+        destination_account_id: 6d1e9c33-72b4-4f0f-8d6e-1c7a9b2e4f55
+        amount: 12500
+        currency: GHS
+        reference: Invoice 1042
+
+    ReverseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string, maxLength: 200 }
+
+    TransferStatus:
+      type: string
+      enum: [PENDING, POSTED, FAILED, REVERSED]
+
+    TransferType:
+      type: string
+      enum: [TRANSFER, DEPOSIT, WITHDRAWAL, REVERSAL]
+
+    Transfer:
+      type: object
+      required:
+        - id
+        - transfer_type
+        - status
+        - source_account_id
+        - destination_account_id
+        - source_amount
+        - source_currency
+        - destination_currency
+        - created_at
+      properties:
+        id: { type: string, format: uuid }
+        transfer_type: { $ref: '#/components/schemas/TransferType' }
+        status: { $ref: '#/components/schemas/TransferStatus' }
+        failure_reason:
+          type: string
+          nullable: true
+          enum: [FX_RATE_UNAVAILABLE, FX_RATE_STALE, AMOUNT_TOO_SMALL, PROCESSING_ERROR]
+          description: Present if and only if status is FAILED
+        source_account_id: { type: string, format: uuid }
+        destination_account_id: { type: string, format: uuid }
+        source_amount: { type: integer, format: int64 }
+        source_currency: { $ref: '#/components/schemas/CurrencyCode' }
+        destination_amount:
+          type: integer
+          format: int64
+          nullable: true
+          description: Null for a PENDING or FAILED cross-currency transfer until posted
+        destination_currency: { $ref: '#/components/schemas/CurrencyCode' }
+        fx_rate:
+          type: string
+          nullable: true
+          description: Rate used (decimal string); set when posted across currencies
+          example: '0.07250000'
+        reverses_transfer_id: { type: string, format: uuid, nullable: true }
+        reversed_by_transfer_id: { type: string, format: uuid, nullable: true }
+        reference: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        posted_at: { type: string, format: date-time, nullable: true }
+      example:
+        id: 9c2a1b64-5d3e-4b7f-a8c1-0e4d6f2b7a13
+        transfer_type: TRANSFER
+        status: PENDING
+        failure_reason: null
+        source_account_id: 0b6f4a52-3c8e-4d1a-9a77-5a2f3c1d8e90
+        destination_account_id: 6d1e9c33-72b4-4f0f-8d6e-1c7a9b2e4f55
+        source_amount: 12500
+        source_currency: GHS
+        destination_amount: null
+        destination_currency: USD
+        fx_rate: null
+        reverses_transfer_id: null
+        reversed_by_transfer_id: null
+        reference: Invoice 1042
+        created_at: '2026-10-07T10:15:30.123Z'
+        posted_at: null
+
+    StatementLine:
+      type: object
+      required: [entry_id, transfer_id, transfer_type, amount, running_balance, created_at]
+      properties:
+        entry_id: { type: integer, format: int64 }
+        transfer_id: { type: string, format: uuid }
+        transfer_type: { $ref: '#/components/schemas/TransferType' }
+        amount:
+          type: integer
+          format: int64
+          description: 'Signed: debit negative, credit positive'
+        running_balance:
+          type: integer
+          format: int64
+          description: Sum of all of the account's entries up to and including this one
+        reference: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    Statement:
+      type: object
+      required: [account_id, currency, opening_balance, closing_balance, lines]
+      properties:
+        account_id: { type: string, format: uuid }
+        currency: { $ref: '#/components/schemas/CurrencyCode' }
+        opening_balance:
+          type: integer
+          format: int64
+          description: Balance immediately before the first returned line
+        closing_balance:
+          type: integer
+          format: int64
+          description: Balance after the last returned line
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/StatementLine' }
+        next_cursor:
+          type: string
+          nullable: true
+
+    FxRateCreate:
+      type: object
+      required: [base_currency, quote_currency, rate]
+      additionalProperties: false
+      properties:
+        base_currency: { $ref: '#/components/schemas/CurrencyCode' }
+        quote_currency: { $ref: '#/components/schemas/CurrencyCode' }
+        rate:
+          type: string
+          pattern: '^[0-9]{1,10}(\.[0-9]{1,8})?$'
+          description: Units of quote currency per 1 unit of base currency (major units); greater than zero
+          example: '0.07250000'
+        effective_at:
+          type: string
+          format: date-time
+          description: Defaults to now
+
+    FxRate:
+      type: object
+      required: [id, base_currency, quote_currency, rate, source, effective_at]
+      properties:
+        id: { type: integer, format: int64 }
+        base_currency: { $ref: '#/components/schemas/CurrencyCode' }
+        quote_currency: { $ref: '#/components/schemas/CurrencyCode' }
+        rate: { type: string, example: '0.07250000' }
+        source: { type: string, example: MANUAL, description: "MANUAL or PROVIDER:<name>" }
+        effective_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
